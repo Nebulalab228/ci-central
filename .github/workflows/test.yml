@@ -1,0 +1,21 @@
+name: Test
+
+# pr-review.yml carries its review logic as an inline `script:`, which nothing type-checks.
+# test/pr-review.test.mjs extracts that exact script and exercises it against a mocked
+# GitHub API and a stubbed fetch, so a broken retry/fallback/packing path is caught here
+# rather than on someone else's pull request.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node test/pr-review.test.mjs
