@@ -58,6 +58,10 @@ on:
 jobs:
   ai-pr-review:
     runs-on: ubuntu-latest
+    # Backstop only. The script bounds each model with MODEL_BUDGET_MS (~6 min) and runs
+    # models in parallel, so a real run finishes in a few minutes; this just guarantees a
+    # hung upstream can never hold a runner the way one 26-minute job did.
+    timeout-minutes: 20
     permissions:
       contents: read
       issues: write
@@ -209,8 +213,14 @@ jobs:
             };
             const MODEL_LABELS = parseJsonEnv('PR_REVIEW_MODEL_LABELS');
             const FALLBACKS = parseJsonEnv('PR_REVIEW_FALLBACKS');
-            const maxAttempts = 4;
-            const requestTimeoutMs = 480000;
+            const maxAttempts = 3;
+            // A healthy response with heavy reasoning has been observed at ~270s, so give one
+            // attempt 5 minutes. But an upstream can also accept the connection and then hang
+            // without replying; MODEL_BUDGET_MS is a hard wall-clock cap so retries + the
+            // field-repair loop can never run away (the regression that let one job spin for
+            // 26 minutes was a 480s timeout x 4 attempts x a fallback chain).
+            const requestTimeoutMs = 300000;
+            const MODEL_BUDGET_MS = 360000;
 
             // Some upstreams (e.g. MiniMax) inline their chain-of-thought into `content`
             // instead of `reasoning_content`. Never let that reach the PR comment.
@@ -246,7 +256,7 @@ jobs:
               };
             }
 
-            async function callOnce(model, payload) {
+            async function callOnce(model, payload, deadline) {
               const requestBody = JSON.stringify(payload);
               let response;
               let responseText = '';
@@ -255,8 +265,16 @@ jobs:
                 response = undefined;
                 responseText = '';
                 requestError = '';
+                // Never let a single attempt run past the model's wall-clock budget: cap it to
+                // whatever time is left, and give up rather than starting an attempt with none.
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                  requestError = `Gave up on ${model} after its ${MODEL_BUDGET_MS / 1000}s budget was exhausted (upstream likely hung).`;
+                  console.log(`[${model}] attempt ${attempt}/${maxAttempts} skipped: model budget exhausted`);
+                  break;
+                }
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+                const timeout = setTimeout(() => controller.abort(), Math.min(requestTimeoutMs, remaining));
                 try {
                   response = await fetch(`${baseUrl}/chat/completions`, {
                     method: 'POST',
@@ -272,7 +290,7 @@ jobs:
                   responseText = await response.text();
                 } catch (error) {
                   requestError = error?.name === 'AbortError'
-                    ? `AI endpoint request timed out after ${requestTimeoutMs / 1000} seconds.`
+                    ? 'AI endpoint request aborted (per-attempt timeout or model budget reached).'
                     : (error?.message || String(error));
                 } finally {
                   clearTimeout(timeout);
@@ -285,10 +303,12 @@ jobs:
                 // request/auth problems that will not fix themselves on retry.
                 const retriable = !response || response.status >= 500 || response.status === 429;
                 if (!retriable || attempt === maxAttempts) break;
-                // Exponential backoff with jitter (~3s, ~9s, ~27s): rides out short upstream
-                // blips without stalling the job when an upstream is down for hours.
-                const backoff = 3000 * Math.pow(3, attempt - 1);
-                await new Promise((resolve) => setTimeout(resolve, backoff + Math.floor(Math.random() * 1000)));
+                // Exponential backoff with jitter (~3s, ~9s): rides out short upstream blips.
+                // Skip the wait entirely if it would eat into the budget — better to spend the
+                // remaining time on a real attempt (or on the fallback) than on sleeping.
+                const backoff = 3000 * Math.pow(3, attempt - 1) + Math.floor(Math.random() * 1000);
+                if (Date.now() + backoff >= deadline) break;
+                await new Promise((resolve) => setTimeout(resolve, backoff));
               }
               return { response, responseText, requestError };
             }
@@ -297,9 +317,13 @@ jobs:
             // about which optional fields exist. When one rejects a field by name, drop it and
             // retry rather than losing the whole review.
             async function callModel(model) {
+              // One budget per model covers all its attempts and field-repair retries. Each
+              // model in a fallback chain gets a fresh budget, so a hung primary is abandoned
+              // in bounded time and the fallback still gets its own full window.
+              const deadline = Date.now() + MODEL_BUDGET_MS;
               const payload = basePayload(model);
               for (let repair = 0; repair <= DROPPABLE_FIELDS.size; repair++) {
-                const result = await callOnce(model, payload);
+                const result = await callOnce(model, payload, deadline);
                 if (result.response?.status !== 400) return result;
                 const text = result.responseText || '';
                 const matched = EXTRA_FIELD_REJECTED.map((re) => re.exec(text)).find(Boolean);
@@ -308,7 +332,7 @@ jobs:
                 console.log(`[${model}] upstream rejected optional field '${field}'; dropping it and retrying.`);
                 delete payload[field];
               }
-              return callOnce(model, payload);
+              return callOnce(model, payload, deadline);
             }
 
             function extractReview(model, responseText) {

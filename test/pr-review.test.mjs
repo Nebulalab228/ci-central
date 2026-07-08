@@ -72,8 +72,13 @@ const okBody = (model, content, extra = {}) => JSON.stringify({
 const reply = (status, text) => ({ ok: status < 400, status, text: async () => text });
 
 // ------------------------------------------------------------------ harness
+// `route(model, opts)` returns a stubbed Response. `clockPerFetch`, when set, replaces
+// Date.now() with a fake clock that jumps forward that many ms on every fetch — this lets
+// the wall-clock budget (MODEL_BUDGET_MS) be exercised deterministically without real waits.
+// `hangUntilAbort` makes a request never resolve until its AbortController fires, so the
+// per-attempt timeout / budget abort path can be tested with backoff sleeps collapsed to 0.
 let captured = [];
-async function scenario({ route, files = FILES, commentBehaviour = () => true, env = {} }) {
+async function scenario({ route, files = FILES, commentBehaviour = () => true, env = {}, clockPerFetch = 0 }) {
   captured = [];
   const posted = [];
   const logs = [];
@@ -93,10 +98,22 @@ async function scenario({ route, files = FILES, commentBehaviour = () => true, e
     },
     paginate: async (fn) => (fn === 'LF' ? files : [{ commit: { message: 'add tags' } }]),
   };
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  if (clockPerFetch) Date.now = () => fakeNow;
   const stubFetch = async (_url, opts) => {
     const body = JSON.parse(opts.body);
     captured.push(body);
-    return route(body.model);
+    if (clockPerFetch) fakeNow += clockPerFetch;
+    const res = route(body.model, opts);
+    if (res === 'HANG') {
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () => {
+          const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+        });
+      });
+    }
+    return res;
   };
   let threw = null;
   try {
@@ -105,7 +122,7 @@ async function scenario({ route, files = FILES, commentBehaviour = () => true, e
       (fn) => setTimeout(fn, 0), clearTimeout,            // collapse backoff sleeps
       { log: (...a) => logs.push(a.join(' ')) },
     );
-  } catch (e) { threw = e; }
+  } catch (e) { threw = e; } finally { Date.now = realNow; }
   return { posted, logs, threw, captured: [...captured] };
 }
 
@@ -132,13 +149,49 @@ check('payload: required fields present', r.captured.every((c) => c.model && c.m
 
 // ------------------------------------------------------------------ 3. upstream outage -> fallback
 r = await scenario({ route: (m) => (m === 'qwen3.7-plus' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))) });
-check('outage: primary retried 4x', r.captured.filter((c) => c.model === 'qwen3.7-plus').length === 4);
+check('outage: primary retried maxAttempts (3) times', r.captured.filter((c) => c.model === 'qwen3.7-plus').length === 3);
 check('outage: fallback model invoked', r.captured.some((c) => c.model === 'minimax-m3'));
 check('outage: review still posted', r.posted.length === 2);
 const degradedBody = r.posted.find((b) => b.includes('ai-pr-review-bot:qwen3.7-plus'));
 check('outage: degraded banner rendered', /\n\n> ℹ️ .*由备用模型 `MiniMax-M3` 生成。\n\n/.test(degradedBody));
 check('outage: footer names both models', degradedBody.includes('Model: qwen3.7-plus unavailable -> served by minimax-m3'));
 check('outage: healthy model unaffected', r.posted.some((b) => b.includes('# review by glm-5.2')));
+
+// ------------------------------------------------------------------ 3b. hung upstream is bounded
+// An upstream that accepts the connection and never replies must be aborted and fall back,
+// not spin forever (the 26-minute job). Backoff sleeps are collapsed, so the abort path runs
+// immediately here; in production each attempt is capped at requestTimeoutMs.
+r = await scenario({ route: (m) => (m === 'glm-5.2' ? 'HANG' : reply(200, okBody(m, `# review by ${m}`))) });
+check('hang: primary aborted after maxAttempts (3), not more', r.captured.filter((c) => c.model === 'glm-5.2').length === 3);
+check('hang: falls back to a different upstream', r.captured.some((c) => c.model === 'kimi-k2.6'));
+check('hang: review still posted for the hung model', r.posted.some((b) => b.includes('ai-pr-review-bot:glm-5.2') && b.includes('由备用模型')));
+check('hang: healthy model unaffected', r.posted.some((b) => b.includes('# review by qwen3.7-plus')));
+
+// ------------------------------------------------------------------ 3c. wall-clock budget cuts retries short
+// A slow-but-not-instant upstream: each call burns 200s of the 360s budget, so the model is
+// abandoned after 2 attempts (not the full 3) and control moves to the fallback. Single model
+// so the shared fake clock is advanced only by this chain; the fake clock makes it deterministic.
+const SOLO = { PR_REVIEW_MODELS: 'glm-5.2', PR_REVIEW_FALLBACKS: '{"glm-5.2":["kimi-k2.6"]}' };
+r = await scenario({
+  clockPerFetch: 200000,
+  env: SOLO,
+  route: (m) => (m === 'glm-5.2' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))),
+});
+check('budget: primary stopped before maxAttempts when time runs out', r.captured.filter((c) => c.model === 'glm-5.2').length === 2);
+check('budget: still falls back and posts', r.captured.some((c) => c.model === 'kimi-k2.6') && r.posted.length === 1);
+
+// 3d. the budget is shared across the field-repair loop: once it is spent, the next attempt is
+// skipped rather than fired. glm 400s on 'temperature' (dropped), and by the retry the 400s-per-
+// fetch clock has already blown the 360s budget, so the repaired attempt never leaves the ground.
+r = await scenario({
+  clockPerFetch: 400000,
+  env: SOLO,
+  route: (m) => (m === 'glm-5.2' ? reply(400, FIREWORKS_400) : reply(200, okBody(m, `# review by ${m}`))),
+});
+check('budget: repaired attempt skipped once budget is spent', r.captured.filter((c) => c.model === 'glm-5.2').length === 1);
+check('budget: budget-exhausted skip is logged', r.logs.some((l) => l.includes('model budget exhausted')));
+check('budget: field drop still logged before skip', r.logs.some((l) => l.includes("rejected optional field 'temperature'")));
+check('budget: falls back after giving up', r.captured.some((c) => c.model === 'kimi-k2.6') && r.posted.length === 1);
 
 // ------------------------------------------------------------------ 4. whole chain down
 r = await scenario({ route: () => reply(503, FAILOVER_503) });
