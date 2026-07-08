@@ -168,4 +168,5 @@ jobs:
 - 模型响应:最终结论读 `message.content`,思考链读 `message.reasoning_content`。
 - **别加 `enable_thinking: true`**。它曾经能用(当时 `glm-5.2` 走 `frank` 上游),网关把 `glm-5.2` 换到 Fireworks 之后直接 400:`Extra inputs are not permitted, field: 'enable_thinking'`。而且**根本不需要**——会思考的模型不带这个字段照样返回 `reasoning_content`(实测 glm-5.2 28266 字、qwen3.7-plus 24417 字)。同理,任何"可选参数"都可能被下一个上游拒绝,`callModel()` 会按名字摘掉被拒字段重试一次。
 - **上游会在你不知情时被换掉**。同一个模型 id,今天是 `frank/GLM-5.2`,明天是 `accounts/fireworks/models/glm-5p2`,请求契约跟着变。所以请求体只带各家都认的字段,并且靠 job 日志里的 `upstream=` 追踪实际由谁服务。
+- **上游会「假死」**(TCP 连上但一直不回包),不只是报 5xx。所以每个模型有一个 `MODEL_BUDGET_MS`(~6 分钟)的**总时长上限**:单次尝试封顶 `requestTimeoutMs`(5 分钟,够最重的思考响应 ~270s),预算耗尽就放弃该模型转 fallback,重试的退避永不睡过预算线。job 上还有 `timeout-minutes: 20` 兜底。**别再把这些值往大调**——曾经把单次超时抬到 480s×4 次,撞上上游假死时一个 job 空转了 26 分钟。想验证:测试里 `clockPerFetch` 用假时钟把预算路径跑通,不需要真等。
 - **改完先跑测试**:`node test/pr-review.test.mjs`。它把 `pr-review.yml` 里那段内联 `script:` 原样抠出来,配 mock 的 GitHub API 和 stub 的 `fetch` 执行,覆盖降级链、剥 `<think>`、字段自愈、diff 打包/截断、发评论失败等路径。不需要任何密钥,PR 上自动跑(见 `.github/workflows/test.yml`)。
