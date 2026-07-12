@@ -10,8 +10,8 @@
 
 ```
 业务仓库 (.github/workflows/ai-pr-review.yml)   ← 瘦身 caller,~10 行
-        │  uses: Nebulalab228/ci-central/.github/workflows/pr-review.yml@main
-        │  secrets: inherit
+        │  uses: TshyGO/ci-central/.github/workflows/pr-review.yml@main
+        │  secrets: 显式映射两个 PR Agent 仓库级 secret
         ▼
 ci-central/.github/workflows/pr-review.yml     ← 真正的审查逻辑(本仓库)
         │  调 OpenAI 兼容端点 /chat/completions
@@ -47,14 +47,15 @@ curl -sS "$BASE/chat/completions" -H "authorization: Bearer $KEY" \
 
 平时也不用猜:每次 review 的 job 日志里都有 `[<model>] upstream=<实际上游>`。
 
-**密钥/地址(secret)来源,分两种仓库:**
+**密钥/地址(secret)来源:**
 
-| 仓库类型 | secret 来源 | 原因 |
-|---|---|---|
-| **公开仓**(NebulaLab-Docs、NebulaLab-Plugins) | **组织级 secret** `PR_AGENT_OPENAI_API_BASE` / `PR_AGENT_OPENAI_KEY` | org secret 可下发给公开仓 |
-| **私有仓**(NebulaLab) | **仓库级 secret**(同名) | ⚠️ GitHub 免费组织的 org secret **不能**下发给私有仓 |
+| 仓库 | secret 来源 |
+|---|---|
+| NebulaLab | 仓库级 `PR_AGENT_OPENAI_API_BASE` / `PR_AGENT_OPENAI_KEY` |
+| NebulaLab-Docs | 仓库级同名 secret |
+| NebulaLab-Plugins | 仓库级同名 secret |
 
-> 所有仓库必须在 `Nebulalab228` 组织内,且 `secrets: inherit` 会把 caller 仓库可见的 secret 透传给本可复用 workflow。
+> 所有仓库均位于 `TshyGO` 个人账号下。调用方必须显式映射两个 secret，避免依赖组织级 secret 或跨仓继承行为。
 
 ---
 
@@ -95,18 +96,17 @@ curl -s https://opencode.ai/zen/go/v1/models -H "Authorization: Bearer <KEY>" | 
 新供应商需是 **OpenAI 兼容**(`/chat/completions`,返回 `choices[].message.content`;思考链放 `reasoning_content`)。
 
 ```bash
-# (a) 公开仓 —— 改组织级 secret(覆盖 Docs / Plugins)
-gh secret set PR_AGENT_OPENAI_API_BASE --org Nebulalab228 --visibility selected \
-  --repos "NebulaLab,NebulaLab-Docs,NebulaLab-Plugins" --body "<新 base>"
-gh secret set PR_AGENT_OPENAI_KEY      --org Nebulalab228 --visibility selected \
-  --repos "NebulaLab,NebulaLab-Docs,NebulaLab-Plugins" --body "<新 key>"
-
-# (b) 私有仓 NebulaLab —— 改它自己的仓库级 secret
-gh secret set PR_AGENT_OPENAI_API_BASE -R Nebulalab228/NebulaLab --body "<新 base>"
-gh secret set PR_AGENT_OPENAI_KEY      -R Nebulalab228/NebulaLab --body "<新 key>"
+# 隐藏输入一次，再通过 stdin 写入三个调用仓库
+read -rsp "PR Agent API base: " NEW_BASE && printf '\n'
+read -rsp "PR Agent API key: " NEW_KEY && printf '\n'
+for repo in TshyGO/NebulaLab TshyGO/NebulaLab-Docs TshyGO/NebulaLab-Plugins; do
+  printf '%s' "$NEW_BASE" | gh secret set PR_AGENT_OPENAI_API_BASE -R "$repo"
+  printf '%s' "$NEW_KEY" | gh secret set PR_AGENT_OPENAI_KEY -R "$repo"
+done
+unset NEW_BASE NEW_KEY
 ```
 
-> 想做到"真·改 1 处":把 NebulaLab 改为公开仓,或把 org 升级到 GitHub Team——届时私有仓也能吃 org secret,(b) 步可省。
+> GitHub 不允许读取已有 secret 的明文。轮换密钥时应从同一可信来源向三个调用仓库重新写入。
 
 ### 3. 改 prompt / 审查重点(改 1 处)
 
@@ -114,9 +114,9 @@ gh secret set PR_AGENT_OPENAI_KEY      -R Nebulalab228/NebulaLab --body "<新 ke
 
 ### 4. 接入一个新仓库
 
-1. 把仓库转入 `Nebulalab228` 组织。
+1. 在 `TshyGO` 账号下创建或转入仓库。
 2. 加文件 `.github/workflows/ai-pr-review.yml`,内容见下方"瘦身 caller 模板"。
-3. secret:公开仓自动吃 org secret(若用 `--visibility selected` 记得把新仓库加进 `--repos`);私有仓需 `gh secret set ... -R <repo>` 各设一份。
+3. 在调用仓库设置 `PR_AGENT_OPENAI_API_BASE` 和 `PR_AGENT_OPENAI_KEY` 两个仓库级 secret。
 
 <details><summary>瘦身 caller 模板</summary>
 
@@ -143,12 +143,14 @@ jobs:
           startsWith(github.event.comment.body, '/review')
         )
       )
-    uses: Nebulalab228/ci-central/.github/workflows/pr-review.yml@main
+    uses: TshyGO/ci-central/.github/workflows/pr-review.yml@main
     permissions:
       contents: read
       issues: write
       pull-requests: write
-    secrets: inherit
+    secrets:
+      PR_AGENT_OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
+      PR_AGENT_OPENAI_API_BASE: ${{ secrets.PR_AGENT_OPENAI_API_BASE }}
 ```
 </details>
 
@@ -162,7 +164,7 @@ jobs:
 ## 维护者备忘(踩过的坑)
 
 - **本仓库必须保持公开**:GitHub 不允许"公开仓调用私有仓的可复用 workflow";本仓库公开后,公开+私有业务仓都能调。本仓库内**无任何密钥**(secret 运行时注入),公开安全。
-- **免费 org 的私有仓**:用不了 org secret,也用不了 ruleset(返回 403)。私有业务仓只能各自带 repo secret。
+- **个人账号下的调用仓库**:每个仓库各自保存 repo secret，并在 caller 中显式映射。
 - **业务仓的 main 有 ruleset 拦直推时**:临时给 ruleset 加 `RepositoryRole admin / always` bypass → `gh pr merge <n> --admin --squash` → 把 `bypass_actors` 还原。
 - **测 `/review` 别用 Git Bash**:它会把 `/review` 当路径转换成 `D:/Git/review` 导致 `if` 不匹配。用 PowerShell 发评论,或设 `MSYS_NO_PATHCONV=1`。
 - 模型响应:最终结论读 `message.content`,思考链读 `message.reasoning_content`。

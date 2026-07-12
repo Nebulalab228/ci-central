@@ -51,7 +51,7 @@ const pull = {
 };
 const context = {
   payload: { pull_request: { number: 42, head: { sha: 'deadbeefcafe' } } },
-  repo: { owner: 'Nebulalab228', repo: 'Example' },
+  repo: { owner: 'TshyGO', repo: 'Example' },
   serverUrl: 'https://github.com', runId: 999,
 };
 const BASE_ENV = {
