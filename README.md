@@ -96,13 +96,14 @@ curl -s https://opencode.ai/zen/go/v1/models -H "Authorization: Bearer <KEY>" | 
 新供应商需是 **OpenAI 兼容**(`/chat/completions`,返回 `choices[].message.content`;思考链放 `reasoning_content`)。
 
 ```bash
-# 三个调用仓库分别设置仓库级 secret
-gh secret set PR_AGENT_OPENAI_API_BASE -R TshyGO/NebulaLab --body "<新 base>"
-gh secret set PR_AGENT_OPENAI_KEY      -R TshyGO/NebulaLab --body "<新 key>"
-gh secret set PR_AGENT_OPENAI_API_BASE -R TshyGO/NebulaLab-Docs --body "<新 base>"
-gh secret set PR_AGENT_OPENAI_KEY      -R TshyGO/NebulaLab-Docs --body "<新 key>"
-gh secret set PR_AGENT_OPENAI_API_BASE -R TshyGO/NebulaLab-Plugins --body "<新 base>"
-gh secret set PR_AGENT_OPENAI_KEY      -R TshyGO/NebulaLab-Plugins --body "<新 key>"
+# 隐藏输入一次，再通过 stdin 写入三个调用仓库
+read -rsp "PR Agent API base: " NEW_BASE && printf '\n'
+read -rsp "PR Agent API key: " NEW_KEY && printf '\n'
+for repo in TshyGO/NebulaLab TshyGO/NebulaLab-Docs TshyGO/NebulaLab-Plugins; do
+  printf '%s' "$NEW_BASE" | gh secret set PR_AGENT_OPENAI_API_BASE -R "$repo"
+  printf '%s' "$NEW_KEY" | gh secret set PR_AGENT_OPENAI_KEY -R "$repo"
+done
+unset NEW_BASE NEW_KEY
 ```
 
 > GitHub 不允许读取已有 secret 的明文。轮换密钥时应从同一可信来源向三个调用仓库重新写入。
