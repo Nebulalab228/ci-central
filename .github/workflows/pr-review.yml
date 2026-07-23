@@ -8,14 +8,22 @@ name: Reusable AI PR Review
 # Model choice is constrained by UPSTREAM diversity, not just quality: the gateway
 # fronts several third-party upstreams, and when one goes down every model behind it
 # returns 503 `failover_exhausted` at once. `models` and `fallbacks` must therefore
-# never share an upstream. Observed mapping (2026-07-08):
-#   Console Go -> qwen3.7-max, deepseek-v4-pro, deepseek-v4-flash, kimi-k2.7-code,
-#                 kimi-k2.5, minimax-m2.7      <- flaky; caused multi-hour outages
-#   Alibaba    -> qwen3.7-plus
+# never share an upstream. Observed mapping (re-probed 2026-07-23):
+#   Console Go -> glm-5.2, kimi-k3, grok-4.5, kimi-k2.7-code, kimi-k2.6, kimi-k2.5,
+#                 deepseek-v4-pro, deepseek-v4-flash, qwen3.7-max, minimax-m2.7,
+#                 minimax-m2.5, hy3            <- flaky; caused multi-hour outages
+#   Alibaba    -> qwen3.7-plus, qwen3.6-plus, qwen3.5-plus
 #   MiniMax    -> minimax-m3   (leaks <think> into content; sanitized below)
-#   moonshotai -> kimi-k2.6
-#   fireworks / frank -> glm-5.2   (two upstreams, so the gateway can fail over)
-# Re-derive it by forcing an upstream error and reading its `Error from provider (<name>)`:
+# The gateway re-routes ids without notice: on 2026-07-08 glm-5.2 sat on fireworks/frank
+# and kimi-k2.6 on moonshotai; both are Console Go now. Re-probe before trusting this list.
+#
+# All three primaries below live on Console Go — the only upstream serving glm-5.2, kimi-k3
+# and grok-4.5 — so every fallback is deliberately parked off it (Alibaba / MiniMax). When
+# Console Go goes down all three reviews degrade at once, but they still get written.
+# kimi-k3 in particular was answering roughly 1 request in 8 on 2026-07-23 (429
+# `Provider rate limit exceeded`, or 400 `Upstream request failed`) while glm-5.2 and
+# grok-4.5 on the same upstream answered first try, so expect its fallback to carry it.
+# Re-derive the mapping by forcing an upstream error and reading `Error from provider (<name>)`:
 #   curl -sS "$BASE/chat/completions" -H "authorization: Bearer $KEY" \
 #     -d '{"model":"<id>","messages":[{"role":"user","content":"hi"}],"temperature":99}'
 # The `upstream=` line this job logs per request records who actually served each review.
@@ -33,17 +41,17 @@ on:
         description: Comma-separated model ids to run in parallel.
         type: string
         required: false
-        default: "glm-5.2,qwen3.7-plus"
+        default: "glm-5.2,kimi-k3,grok-4.5"
       model_labels:
         description: JSON map of model id -> display label.
         type: string
         required: false
-        default: '{"glm-5.2":"GLM-5.2","qwen3.7-plus":"Qwen3.7-Plus","kimi-k2.6":"Kimi-K2.6","minimax-m3":"MiniMax-M3"}'
+        default: '{"glm-5.2":"GLM-5.2","kimi-k3":"Kimi-K3","grok-4.5":"Grok-4.5","minimax-m3":"MiniMax-M3","qwen3.7-plus":"Qwen3.7-Plus","qwen3.6-plus":"Qwen3.6-Plus"}'
       fallbacks:
         description: JSON map of model id -> ordered fallback model ids, tried when the primary keeps failing. Each fallback MUST sit on a different upstream than its primary.
         type: string
         required: false
-        default: '{"glm-5.2":["kimi-k2.6"],"qwen3.7-plus":["minimax-m3"]}'
+        default: '{"glm-5.2":["minimax-m3"],"kimi-k3":["qwen3.7-plus"],"grok-4.5":["qwen3.6-plus"]}'
       diff_char_budget:
         description: Max characters of patch text sent to the model. Whole files are packed in order; test files are packed last so they are dropped first.
         type: number
@@ -242,7 +250,8 @@ jobs:
             ];
 
             // No `enable_thinking`: every model here emits `reasoning_content` on its own when
-            // it thinks, and the Fireworks upstream behind glm-5.2 rejects the field with a 400.
+            // it thinks, and it once cost a whole review when the Fireworks upstream then behind
+            // glm-5.2 started 400ing on the field. Verified on glm-5.2 / kimi-k3 / grok-4.5.
             function basePayload(model) {
               return {
                 model,
