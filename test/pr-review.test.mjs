@@ -56,9 +56,9 @@ const context = {
 };
 const BASE_ENV = {
   OPENAI_API_KEY: 'test-key', OPENAI_API_BASE: 'https://example.test/v1/',
-  PR_REVIEW_MODELS: 'glm-5.2,qwen3.7-plus',
-  PR_REVIEW_MODEL_LABELS: '{"glm-5.2":"GLM-5.2","qwen3.7-plus":"Qwen3.7-Plus","kimi-k2.6":"Kimi-K2.6","minimax-m3":"MiniMax-M3"}',
-  PR_REVIEW_FALLBACKS: '{"glm-5.2":["kimi-k2.6"],"qwen3.7-plus":["minimax-m3"]}',
+  PR_REVIEW_MODELS: 'glm-5.2,kimi-k3,grok-4.5',
+  PR_REVIEW_MODEL_LABELS: '{"glm-5.2":"GLM-5.2","kimi-k3":"Kimi-K3","grok-4.5":"Grok-4.5","minimax-m3":"MiniMax-M3","qwen3.7-max":"Qwen3.7-Max"}',
+  PR_REVIEW_FALLBACKS: '{"glm-5.2":["minimax-m3"],"kimi-k3":["qwen3.7-max"],"grok-4.5":["qwen3.7-max"]}',
   PR_REVIEW_DIFF_BUDGET: '100000',
 };
 
@@ -136,8 +136,8 @@ const promptOf = (r) => r.captured[0].messages[1].content;
 
 // ------------------------------------------------------------------ 1. happy path
 let r = await scenario({ route: (m) => reply(200, okBody(m, `# review by ${m}`)) });
-check('happy: one comment per configured model', r.posted.length === 2);
-check('happy: primaries used', r.captured.map((c) => c.model).sort().join(',') === 'glm-5.2,qwen3.7-plus');
+check('happy: one comment per configured model', r.posted.length === 3);
+check('happy: primaries used', r.captured.map((c) => c.model).sort().join(',') === 'glm-5.2,grok-4.5,kimi-k3');
 check('happy: no degraded banner', !r.posted.some((b) => b.includes('备用模型')));
 check('happy: actual upstream is logged', r.logs.some((l) => l.includes('upstream=upstream/glm-5.2')));
 check('happy: footer is its own paragraph', /\n\n<sub>Model: /.test(r.posted[0]));
@@ -148,13 +148,13 @@ check('payload: enable_thinking is never sent', r.captured.every((c) => !('enabl
 check('payload: required fields present', r.captured.every((c) => c.model && c.messages?.length === 2 && c.stream === false));
 
 // ------------------------------------------------------------------ 3. upstream outage -> fallback
-r = await scenario({ route: (m) => (m === 'qwen3.7-plus' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))) });
-check('outage: primary retried maxAttempts (3) times', r.captured.filter((c) => c.model === 'qwen3.7-plus').length === 3);
-check('outage: fallback model invoked', r.captured.some((c) => c.model === 'minimax-m3'));
-check('outage: review still posted', r.posted.length === 2);
-const degradedBody = r.posted.find((b) => b.includes('ai-pr-review-bot:qwen3.7-plus'));
-check('outage: degraded banner rendered', /\n\n> ℹ️ .*由备用模型 `MiniMax-M3` 生成。\n\n/.test(degradedBody));
-check('outage: footer names both models', degradedBody.includes('Model: qwen3.7-plus unavailable -> served by minimax-m3'));
+r = await scenario({ route: (m) => (m === 'kimi-k3' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))) });
+check('outage: primary retried maxAttempts (3) times', r.captured.filter((c) => c.model === 'kimi-k3').length === 3);
+check('outage: fallback model invoked', r.captured.some((c) => c.model === 'qwen3.7-max'));
+check('outage: review still posted', r.posted.length === 3);
+const degradedBody = r.posted.find((b) => b.includes('ai-pr-review-bot:kimi-k3'));
+check('outage: degraded banner rendered', /\n\n> ℹ️ .*由备用模型 `Qwen3\.7-Max` 生成。\n\n/.test(degradedBody));
+check('outage: footer names both models', degradedBody.includes('Model: kimi-k3 unavailable -> served by qwen3.7-max'));
 check('outage: healthy model unaffected', r.posted.some((b) => b.includes('# review by glm-5.2')));
 
 // ------------------------------------------------------------------ 3b. hung upstream is bounded
@@ -163,22 +163,22 @@ check('outage: healthy model unaffected', r.posted.some((b) => b.includes('# rev
 // immediately here; in production each attempt is capped at requestTimeoutMs.
 r = await scenario({ route: (m) => (m === 'glm-5.2' ? 'HANG' : reply(200, okBody(m, `# review by ${m}`))) });
 check('hang: primary aborted after maxAttempts (3), not more', r.captured.filter((c) => c.model === 'glm-5.2').length === 3);
-check('hang: falls back to a different upstream', r.captured.some((c) => c.model === 'kimi-k2.6'));
+check('hang: falls back to a different upstream', r.captured.some((c) => c.model === 'minimax-m3'));
 check('hang: review still posted for the hung model', r.posted.some((b) => b.includes('ai-pr-review-bot:glm-5.2') && b.includes('由备用模型')));
-check('hang: healthy model unaffected', r.posted.some((b) => b.includes('# review by qwen3.7-plus')));
+check('hang: healthy model unaffected', r.posted.some((b) => b.includes('# review by grok-4.5')));
 
 // ------------------------------------------------------------------ 3c. wall-clock budget cuts retries short
 // A slow-but-not-instant upstream: each call burns 200s of the 360s budget, so the model is
 // abandoned after 2 attempts (not the full 3) and control moves to the fallback. Single model
 // so the shared fake clock is advanced only by this chain; the fake clock makes it deterministic.
-const SOLO = { PR_REVIEW_MODELS: 'glm-5.2', PR_REVIEW_FALLBACKS: '{"glm-5.2":["kimi-k2.6"]}' };
+const SOLO = { PR_REVIEW_MODELS: 'glm-5.2', PR_REVIEW_FALLBACKS: '{"glm-5.2":["minimax-m3"]}' };
 r = await scenario({
   clockPerFetch: 200000,
   env: SOLO,
   route: (m) => (m === 'glm-5.2' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))),
 });
 check('budget: primary stopped before maxAttempts when time runs out', r.captured.filter((c) => c.model === 'glm-5.2').length === 2);
-check('budget: still falls back and posts', r.captured.some((c) => c.model === 'kimi-k2.6') && r.posted.length === 1);
+check('budget: still falls back and posts', r.captured.some((c) => c.model === 'minimax-m3') && r.posted.length === 1);
 
 // 3d. the budget is shared across the field-repair loop: once it is spent, the next attempt is
 // skipped rather than fired. glm 400s on 'temperature' (dropped), and by the retry the 400s-per-
@@ -191,12 +191,12 @@ r = await scenario({
 check('budget: repaired attempt skipped once budget is spent', r.captured.filter((c) => c.model === 'glm-5.2').length === 1);
 check('budget: budget-exhausted skip is logged', r.logs.some((l) => l.includes('model budget exhausted')));
 check('budget: field drop still logged before skip', r.logs.some((l) => l.includes("rejected optional field 'temperature'")));
-check('budget: falls back after giving up', r.captured.some((c) => c.model === 'kimi-k2.6') && r.posted.length === 1);
+check('budget: falls back after giving up', r.captured.some((c) => c.model === 'minimax-m3') && r.posted.length === 1);
 
 // ------------------------------------------------------------------ 4. whole chain down
 r = await scenario({ route: () => reply(503, FAILOVER_503) });
-check('chain down: diagnostic comments still posted', r.posted.length === 2 && r.threw === null);
-check('chain down: lists every model tried', r.posted[1].includes('qwen3.7-plus -> HTTP 503') && r.posted[1].includes('minimax-m3 -> HTTP 503'));
+check('chain down: diagnostic comments still posted', r.posted.length === 3 && r.threw === null);
+check('chain down: lists every model tried', r.posted[1].includes('kimi-k3 -> HTTP 503') && r.posted[1].includes('qwen3.7-max -> HTTP 503'));
 check('chain down: explains failover_exhausted', r.posted[0].includes('provider-side outage, not a problem with this repo'));
 
 // ------------------------------------------------------------------ 5. optional-field repair
@@ -209,7 +209,7 @@ r = await scenario({
 });
 const glmCalls = r.captured.filter((c) => c.model === 'glm-5.2');
 check('repair: retried without the rejected field', glmCalls.length === 2 && !('temperature' in glmCalls[1]));
-check('repair: primary still serves (no fallback)', !r.captured.some((c) => c.model === 'kimi-k2.6'));
+check('repair: primary still serves (no fallback)', !r.captured.some((c) => c.model === 'minimax-m3'));
 check('repair: drop is logged', r.logs.some((l) => l.includes("rejected optional field 'temperature'")));
 
 r = await scenario({
@@ -218,7 +218,7 @@ r = await scenario({
     : reply(200, okBody(m, 'ok'))),
 });
 check('repair: required fields are never dropped', r.captured.filter((c) => c.model === 'glm-5.2').length === 1);
-check('repair: unrepairable 400 falls back instead', r.captured.some((c) => c.model === 'kimi-k2.6'));
+check('repair: unrepairable 400 falls back instead', r.captured.some((c) => c.model === 'minimax-m3'));
 
 // ------------------------------------------------------------------ 6. non-retriable 4xx
 r = await scenario({ route: (m) => (m === 'glm-5.2' ? reply(404, '{"error":"nope"}') : reply(200, okBody(m, 'ok'))) });
@@ -238,7 +238,7 @@ check('footer: says "not reported" when absent', r.posted[1].includes('Thinking:
 
 // ------------------------------------------------------------------ 8. comment posting
 r = await scenario({ route: (m) => reply(200, okBody(m, 'ok')), commentBehaviour: (_b, n) => (n === 0 ? new Error('403') : true) });
-check('posting: one failed comment does not swallow the other', r.posted.length === 1 && r.threw === null);
+check('posting: one failed comment does not swallow the others', r.posted.length === 2 && r.threw === null);
 
 r = await scenario({ route: (m) => reply(200, okBody(m, 'ok')), commentBehaviour: () => new Error('403') });
 check('posting: total failure fails the job loudly', /No AI PR Review comment could be posted/.test(r.threw?.message || ''));
@@ -269,7 +269,7 @@ check('packing: oversized file still respects the budget', hugePacked <= 5000, `
 
 // ------------------------------------------------------------------ 10. bad config must not crash
 r = await scenario({ route: (m) => reply(200, okBody(m, 'ok')), env: { PR_REVIEW_FALLBACKS: '{not json' } });
-check('config: malformed fallbacks JSON is ignored, job survives', r.posted.length === 2 && r.threw === null);
+check('config: malformed fallbacks JSON is ignored, job survives', r.posted.length === 3 && r.threw === null);
 
 r = await scenario({ route: (m) => reply(200, okBody(m, 'ok')), env: { PR_REVIEW_DIFF_BUDGET: 'abc' } });
 check('config: non-numeric budget falls back to the default', packLog(r).includes('/100000 patch chars'));
