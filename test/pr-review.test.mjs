@@ -57,8 +57,8 @@ const context = {
 const BASE_ENV = {
   OPENAI_API_KEY: 'test-key', OPENAI_API_BASE: 'https://example.test/v1/',
   PR_REVIEW_MODELS: 'glm-5.2,kimi-k3,grok-4.5',
-  PR_REVIEW_MODEL_LABELS: '{"glm-5.2":"GLM-5.2","kimi-k3":"Kimi-K3","grok-4.5":"Grok-4.5","minimax-m3":"MiniMax-M3","qwen3.7-plus":"Qwen3.7-Plus","qwen3.6-plus":"Qwen3.6-Plus"}',
-  PR_REVIEW_FALLBACKS: '{"glm-5.2":["minimax-m3"],"kimi-k3":["qwen3.7-plus"],"grok-4.5":["qwen3.6-plus"]}',
+  PR_REVIEW_MODEL_LABELS: '{"glm-5.2":"GLM-5.2","kimi-k3":"Kimi-K3","grok-4.5":"Grok-4.5","minimax-m3":"MiniMax-M3","qwen3.7-max":"Qwen3.7-Max"}',
+  PR_REVIEW_FALLBACKS: '{"glm-5.2":["minimax-m3"],"kimi-k3":["qwen3.7-max"],"grok-4.5":["qwen3.7-max"]}',
   PR_REVIEW_DIFF_BUDGET: '100000',
 };
 
@@ -150,11 +150,11 @@ check('payload: required fields present', r.captured.every((c) => c.model && c.m
 // ------------------------------------------------------------------ 3. upstream outage -> fallback
 r = await scenario({ route: (m) => (m === 'kimi-k3' ? reply(503, FAILOVER_503) : reply(200, okBody(m, `# review by ${m}`))) });
 check('outage: primary retried maxAttempts (3) times', r.captured.filter((c) => c.model === 'kimi-k3').length === 3);
-check('outage: fallback model invoked', r.captured.some((c) => c.model === 'qwen3.7-plus'));
+check('outage: fallback model invoked', r.captured.some((c) => c.model === 'qwen3.7-max'));
 check('outage: review still posted', r.posted.length === 3);
 const degradedBody = r.posted.find((b) => b.includes('ai-pr-review-bot:kimi-k3'));
-check('outage: degraded banner rendered', /\n\n> ℹ️ .*由备用模型 `Qwen3\.7-Plus` 生成。\n\n/.test(degradedBody));
-check('outage: footer names both models', degradedBody.includes('Model: kimi-k3 unavailable -> served by qwen3.7-plus'));
+check('outage: degraded banner rendered', /\n\n> ℹ️ .*由备用模型 `Qwen3\.7-Max` 生成。\n\n/.test(degradedBody));
+check('outage: footer names both models', degradedBody.includes('Model: kimi-k3 unavailable -> served by qwen3.7-max'));
 check('outage: healthy model unaffected', r.posted.some((b) => b.includes('# review by glm-5.2')));
 
 // ------------------------------------------------------------------ 3b. hung upstream is bounded
@@ -196,7 +196,7 @@ check('budget: falls back after giving up', r.captured.some((c) => c.model === '
 // ------------------------------------------------------------------ 4. whole chain down
 r = await scenario({ route: () => reply(503, FAILOVER_503) });
 check('chain down: diagnostic comments still posted', r.posted.length === 3 && r.threw === null);
-check('chain down: lists every model tried', r.posted[1].includes('kimi-k3 -> HTTP 503') && r.posted[1].includes('qwen3.7-plus -> HTTP 503'));
+check('chain down: lists every model tried', r.posted[1].includes('kimi-k3 -> HTTP 503') && r.posted[1].includes('qwen3.7-max -> HTTP 503'));
 check('chain down: explains failover_exhausted', r.posted[0].includes('provider-side outage, not a problem with this repo'));
 
 // ------------------------------------------------------------------ 5. optional-field repair
